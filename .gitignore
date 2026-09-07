@@ -1,0 +1,7 @@
+venv/
+.DS_Store
+*.mp4
+runs/
+__pycache__/
+*.pt
+CLAUDE.md

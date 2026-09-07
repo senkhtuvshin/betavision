@@ -1,0 +1,10 @@
+# mediapipe>=1.0 dropped the mp.solutions.pose API and crashes on PoseLandmarker
+# in this environment (Metal calculator service unavailable); pinned to the last
+# 0.10.x release, which requires numpy<2 and opencv-contrib-python instead of
+# opencv-python (both provide the `cv2` module, do not install both).
+opencv-contrib-python==4.11.0.86
+ultralytics
+mediapipe==0.10.21
+yt-dlp
+numpy==1.26.4
+scipy
