@@ -69,14 +69,19 @@ class HoldDetector:
 
     @staticmethod
     def _parse_result(result) -> list[HoldDetection]:
-        detections: list[HoldDetection] = []
-        if result.masks is None or result.boxes is None:
-            return detections
+        if result.boxes is None:
+            return []
 
         orig_h, orig_w = result.orig_shape
+        if result.masks is not None:
+            return HoldDetector._parse_segmentation(result, result.boxes, orig_h, orig_w)
+        return HoldDetector._parse_boxes_only(result.boxes, orig_h, orig_w)
+
+    @staticmethod
+    def _parse_segmentation(result, boxes, orig_h: int, orig_w: int) -> list[HoldDetection]:
+        detections: list[HoldDetection] = []
         raw_masks = result.masks.data.cpu().numpy()  # (N, mask_h, mask_w)
         polygons = result.masks.xy  # list of (N_i, 2) arrays in original-image coordinates
-        boxes = result.boxes
 
         for i in range(len(polygons)):
             polygon = np.asarray(polygons[i], dtype=np.float32)
@@ -96,6 +101,40 @@ class HoldDetector:
                     bbox=bbox,
                     confidence=confidence,
                     class_id=class_id,
+                    centroid=centroid,
+                    area=area,
+                )
+            )
+
+        return detections
+
+    @staticmethod
+    def _parse_boxes_only(boxes, orig_h: int, orig_w: int) -> list[HoldDetection]:
+        """Synthesize a rectangular polygon/mask/centroid/area from each box.
+
+        Lets HoldDetector accept plain (non -seg) YOLOv8 detection checkpoints, which have
+        no mask output, in addition to YOLOv8-seg models.
+        """
+        detections: list[HoldDetection] = []
+
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().tolist()
+            polygon = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+            centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+            mask = np.zeros((orig_h, orig_w), dtype=bool)
+            xi1, yi1 = max(0, round(x1)), max(0, round(y1))
+            xi2, yi2 = min(orig_w, round(x2)), min(orig_h, round(y2))
+            mask[yi1:yi2, xi1:xi2] = True
+
+            detections.append(
+                HoldDetection(
+                    mask=mask,
+                    polygon=polygon,
+                    bbox=(x1, y1, x2, y2),
+                    confidence=float(boxes.conf[i]),
+                    class_id=int(boxes.cls[i]),
                     centroid=centroid,
                     area=area,
                 )
