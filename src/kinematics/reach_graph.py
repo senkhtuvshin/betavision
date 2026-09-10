@@ -15,9 +15,14 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from src.kinematics.pose_tracker import ClimberPose
 from src.vision.hold_detector import HoldDetection
 
 START_NODE_ID = -1
+
+# Limb extremities checked for hold contact.
+CONTACT_LIMBS: tuple[str, ...] = ("LEFT_WRIST", "RIGHT_WRIST", "LEFT_ANKLE", "RIGHT_ANKLE")
+DEFAULT_CONTACT_RADIUS = 50.0  # px fallback if the caller doesn't scale one to the climber's reach
 
 # Weight factors for the edge-cost heuristic; tuned by feel rather than measurement.
 LATERAL_COM_PENALTY = 0.6  # cost per unit of sideways CoM shift between holds
@@ -127,18 +132,50 @@ def edge_cost(a: HoldNode, b: HoldNode, climber: ClimberProfile) -> float | None
     return distance + lateral_penalty + downward_penalty + strain_penalty
 
 
-def find_beta_path(graph: ReachabilityGraph, start_id: int, goal_id: int) -> list[int] | None:
-    """A* search for the lowest-cost sequence of holds from start_id to goal_id."""
-    if start_id not in graph.nodes or goal_id not in graph.nodes:
-        raise KeyError("start_id and goal_id must both be nodes in the graph")
+def find_contact_holds(
+    pose: ClimberPose,
+    holds: list[HoldDetection],
+    contact_radius: float = DEFAULT_CONTACT_RADIUS,
+) -> dict[str, int | None]:
+    """Map each limb extremity (wrists, ankles) to the index of the hold it's grounded on.
+
+    A limb is considered "in contact" with whichever hold is nearest its pixel position, as
+    long as that distance is within `contact_radius`; otherwise it maps to None (e.g. a hand
+    mid-reach, not yet gripping anything).
+    """
+    contacts: dict[str, int | None] = {}
+
+    for limb in CONTACT_LIMBS:
+        limb_position = pose.pixel[limb]
+        nearest_idx: int | None = None
+        nearest_distance = math.inf
+
+        for i, hold in enumerate(holds):
+            distance = math.dist(limb_position, hold.centroid)
+            if distance < nearest_distance:
+                nearest_idx, nearest_distance = i, distance
+
+        contacts[limb] = nearest_idx if nearest_distance <= contact_radius else None
+
+    return contacts
+
+
+def find_beta_path(graph: ReachabilityGraph, start_id: int | list[int], goal_id: int) -> list[int] | None:
+    """A* search for the lowest-cost sequence of holds from start_id (or several, for a
+    multi-limb-grounded start) to goal_id.
+    """
+    start_ids = start_id if isinstance(start_id, list) else [start_id]
+    if not start_ids or any(sid not in graph.nodes for sid in start_ids) or goal_id not in graph.nodes:
+        raise KeyError("start_id(s) and goal_id must all be nodes in the graph")
 
     def heuristic(node_id: int) -> float:
         return math.dist(graph.nodes[node_id].centroid, graph.nodes[goal_id].centroid)
 
     tie_breaker = itertools.count()
-    open_heap = [(heuristic(start_id), next(tie_breaker), start_id)]
+    open_heap = [(heuristic(sid), next(tie_breaker), sid) for sid in start_ids]
+    heapq.heapify(open_heap)
     came_from: dict[int, int] = {}
-    g_score = {start_id: 0.0}
+    g_score = {sid: 0.0 for sid in start_ids}
     visited: set[int] = set()
 
     while open_heap:
@@ -173,33 +210,50 @@ def draw_beta_path(
     frame: np.ndarray,
     graph: ReachabilityGraph,
     path: list[int],
-    line_color: tuple[int, int, int] = (0, 255, 0),
-    start_color: tuple[int, int, int] = (255, 0, 0),
+    line_color: tuple[int, int, int] = (60, 220, 130),
+    start_color: tuple[int, int, int] = (0, 165, 255),
     goal_color: tuple[int, int, int] = (0, 0, 255),
+    glow_radius: int = 6,
 ) -> np.ndarray:
-    """Return a copy of `frame` with the beta path drawn as connected, numbered holds."""
+    """Return a copy of `frame` with a glowing trajectory line and numbered move markers.
+
+    The trajectory is drawn twice: a thick, Gaussian-blurred "glow" pass underneath, then a
+    crisp core line on top. Start and goal holds get distinctive marker colors; intermediate
+    moves are numbered in sequence.
+    """
     overlay = frame.copy()
     points = [tuple(round(v) for v in graph.nodes[node_id].centroid) for node_id in path]
 
-    for p1, p2 in zip(points, points[1:]):
-        cv2.line(overlay, p1, p2, line_color, 3, cv2.LINE_AA)
+    if len(points) > 1:
+        glow_layer = np.zeros_like(frame)
+        for p1, p2 in zip(points, points[1:]):
+            cv2.line(glow_layer, p1, p2, line_color, glow_radius * 2, cv2.LINE_AA)
+        glow_layer = cv2.GaussianBlur(glow_layer, (0, 0), sigmaX=glow_radius)
+        overlay = cv2.addWeighted(overlay, 1.0, glow_layer, 0.7, 0)
+
+        for p1, p2 in zip(points, points[1:]):
+            cv2.line(overlay, p1, p2, line_color, 2, cv2.LINE_AA)
 
     for step, (node_id, point) in enumerate(zip(path, points)):
         if node_id == path[0]:
-            color = start_color
+            marker_color = start_color
         elif node_id == path[-1]:
-            color = goal_color
+            marker_color = goal_color
         else:
-            color = line_color
+            marker_color = line_color
 
-        cv2.circle(overlay, point, 10, color, -1)
+        cv2.circle(overlay, point, 13, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(overlay, point, 11, marker_color, -1, cv2.LINE_AA)
+
+        label = str(step + 1)
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.putText(
             overlay,
-            str(step + 1),
-            (point[0] + 12, point[1]),
+            label,
+            (point[0] - text_w // 2, point[1] + text_h // 2),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
+            0.5,
+            (255, 255, 255),
             2,
             cv2.LINE_AA,
         )

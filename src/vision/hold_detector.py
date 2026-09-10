@@ -1,8 +1,7 @@
-"""YOLOv8-seg based climbing hold detection: masks, boxes, centroids, and overlays."""
+"""YOLOv8-seg based climbing hold detection: masks, boxes, centroids, color, and overlays."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,10 +11,36 @@ from ultralytics import YOLO
 
 DEFAULT_WEIGHTS = "yolov8n-seg.pt"
 
+# Hue ranges (OpenCV HSV: H in [0, 179]) for the primary climbing hold colors. Black/white
+# are handled separately since they're distinguished by value/saturation, not hue. Red wraps
+# around hue 0, so it gets two ranges; "pink" is treated as red, "teal" as blue.
+_HUE_COLOR_RANGES: list[tuple[str, int, int]] = [
+    ("red", 0, 10),
+    ("orange", 11, 25),
+    ("yellow", 26, 35),
+    ("green", 36, 85),
+    ("blue", 86, 130),
+    ("purple", 131, 169),
+    ("red", 170, 179),
+]
+
+# BGR swatches used to render each classified color in overlays.
+COLOR_NAME_TO_BGR: dict[str, tuple[int, int, int]] = {
+    "red": (0, 0, 255),
+    "orange": (0, 140, 255),
+    "yellow": (0, 220, 220),
+    "green": (0, 170, 0),
+    "blue": (220, 130, 0),
+    "purple": (200, 0, 160),
+    "black": (60, 60, 60),
+    "white": (230, 230, 230),
+    "unknown": (160, 160, 160),
+}
+
 
 @dataclass
 class HoldDetection:
-    """A single detected hold: its mask, polygon, box, and derived geometry."""
+    """A single detected hold: its mask, polygon, box, color, and derived geometry."""
 
     mask: np.ndarray  # bool, HxW, same size as the source frame
     polygon: np.ndarray  # float32, Nx2, contour points in source-frame coordinates
@@ -24,6 +49,32 @@ class HoldDetection:
     class_id: int
     centroid: tuple[float, float]
     area: float
+    color: str = "unknown"
+
+
+def classify_hold_color(hsv_frame: np.ndarray, mask: np.ndarray) -> str:
+    """Classify a hold's dominant color from the HSV pixels under its mask.
+
+    Uses the median hue/saturation/value over the masked region (robust to shadow and
+    highlight outliers within the patch) to bucket into one of the primary climbing hold
+    colors, or "black"/"white"/"unknown".
+    """
+    pixels = hsv_frame[mask]
+    if pixels.size == 0:
+        return "unknown"
+
+    hue, saturation, value = np.median(pixels, axis=0)
+
+    if value < 50:
+        return "black"
+    if saturation < 40 and value > 180:
+        return "white"
+
+    for name, low, high in _HUE_COLOR_RANGES:
+        if low <= hue <= high:
+            return name
+
+    return "unknown"
 
 
 def compute_centroid_and_area(polygon: np.ndarray) -> tuple[tuple[float, float], float]:
@@ -45,6 +96,11 @@ def filter_by_confidence(detections: list[HoldDetection], min_confidence: float)
     return [d for d in detections if d.confidence >= min_confidence]
 
 
+def filter_by_color(detections: list[HoldDetection], color: str) -> list[HoldDetection]:
+    """Return only detections classified as `color`, to isolate a single boulder problem."""
+    return [d for d in detections if d.color == color]
+
+
 class HoldDetector:
     """Wraps a YOLOv8-seg model to detect climbing holds in frames."""
 
@@ -63,22 +119,24 @@ class HoldDetector:
         images = [frames] if is_single else frames
 
         results = self.model.predict(images, conf=conf, verbose=False)
-        parsed = [self._parse_result(result) for result in results]
+        parsed = [self._parse_result(result, image) for result, image in zip(results, images)]
 
         return parsed[0] if is_single else parsed
 
     @staticmethod
-    def _parse_result(result) -> list[HoldDetection]:
+    def _parse_result(result, frame: np.ndarray) -> list[HoldDetection]:
         if result.boxes is None:
             return []
 
         orig_h, orig_w = result.orig_shape
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
         if result.masks is not None:
-            return HoldDetector._parse_segmentation(result, result.boxes, orig_h, orig_w)
-        return HoldDetector._parse_boxes_only(result.boxes, orig_h, orig_w)
+            return HoldDetector._parse_segmentation(result, result.boxes, orig_h, orig_w, hsv_frame)
+        return HoldDetector._parse_boxes_only(result.boxes, orig_h, orig_w, hsv_frame)
 
     @staticmethod
-    def _parse_segmentation(result, boxes, orig_h: int, orig_w: int) -> list[HoldDetection]:
+    def _parse_segmentation(result, boxes, orig_h: int, orig_w: int, hsv_frame: np.ndarray) -> list[HoldDetection]:
         detections: list[HoldDetection] = []
         raw_masks = result.masks.data.cpu().numpy()  # (N, mask_h, mask_w)
         polygons = result.masks.xy  # list of (N_i, 2) arrays in original-image coordinates
@@ -103,13 +161,14 @@ class HoldDetector:
                     class_id=class_id,
                     centroid=centroid,
                     area=area,
+                    color=classify_hold_color(hsv_frame, mask),
                 )
             )
 
         return detections
 
     @staticmethod
-    def _parse_boxes_only(boxes, orig_h: int, orig_w: int) -> list[HoldDetection]:
+    def _parse_boxes_only(boxes, orig_h: int, orig_w: int, hsv_frame: np.ndarray) -> list[HoldDetection]:
         """Synthesize a rectangular polygon/mask/centroid/area from each box.
 
         Lets HoldDetector accept plain (non -seg) YOLOv8 detection checkpoints, which have
@@ -137,53 +196,43 @@ class HoldDetector:
                     class_id=int(boxes.cls[i]),
                     centroid=centroid,
                     area=area,
+                    color=classify_hold_color(hsv_frame, mask),
                 )
             )
 
         return detections
 
 
-def _color_for_class(class_id: int) -> tuple[int, int, int]:
-    """Deterministic BGR color per class_id so the same class renders consistently."""
-    digest = hashlib.md5(str(class_id).encode()).digest()
-    return int(digest[0]), int(digest[1]), int(digest[2])
-
-
 def draw_detections(
     frame: np.ndarray,
     detections: list[HoldDetection],
-    draw_masks: bool = True,
-    draw_boxes: bool = True,
+    draw_masks: bool = False,
+    draw_outlines: bool = True,
     draw_centroids: bool = True,
-    mask_alpha: float = 0.4,
+    mask_alpha: float = 0.25,
+    outline_thickness: int = 2,
 ) -> np.ndarray:
-    """Return a copy of `frame` with hold masks, boxes, and centroids overlaid."""
+    """Return a copy of `frame` with clean, color-coded hold outlines (and optional mask fills).
+
+    Holds are colored by their classified `color` (COLOR_NAME_TO_BGR) rather than class id, and
+    labeled with subtle contour outlines instead of boxes with confidence text.
+    """
     overlay = frame.copy()
     mask_layer = frame.copy()
 
     for det in detections:
-        color = _color_for_class(det.class_id)
+        color = COLOR_NAME_TO_BGR.get(det.color, COLOR_NAME_TO_BGR["unknown"])
 
         if draw_masks:
             mask_layer[det.mask] = color
 
-        if draw_boxes:
-            x1, y1, x2, y2 = (int(v) for v in det.bbox)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                overlay,
-                f"{det.confidence:.2f}",
-                (x1, max(0, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+        if draw_outlines:
+            contour = det.polygon.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(overlay, [contour], isClosed=True, color=color, thickness=outline_thickness, lineType=cv2.LINE_AA)
 
         if draw_centroids:
-            cx, cy = int(det.centroid[0]), int(det.centroid[1])
-            cv2.circle(overlay, (cx, cy), 4, color, -1)
+            cx, cy = round(det.centroid[0]), round(det.centroid[1])
+            cv2.circle(overlay, (cx, cy), 3, color, -1, cv2.LINE_AA)
 
     if draw_masks:
         overlay = cv2.addWeighted(mask_layer, mask_alpha, overlay, 1 - mask_alpha, 0)

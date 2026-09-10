@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -31,8 +32,15 @@ from src.kinematics.reach_graph import (
     ReachabilityGraph,
     draw_beta_path,
     find_beta_path,
+    find_contact_holds,
 )
-from src.vision.hold_detector import HoldDetection, HoldDetector, draw_detections, filter_by_confidence
+from src.vision.hold_detector import (
+    HoldDetection,
+    HoldDetector,
+    draw_detections,
+    filter_by_color,
+    filter_by_confidence,
+)
 from src.vision.video_loader import download_video, extract_frames
 
 logger = logging.getLogger(__name__)
@@ -44,6 +52,13 @@ DEFAULT_WEIGHTS = "yolov8n-seg.pt"
 # detected pose's pixel dimensions into a pixels-per-meter calibration.
 SHOULDER_TO_ANKLE_HEIGHT_FRACTION = 0.82
 UNCALIBRATED_PIXELS_PER_METER = 100.0  # fallback used when no pose is detected
+
+# Fraction of the climber's max reach used as the "currently gripping this hold" threshold.
+# Box-only detections center on the hold's bounding box, not necessarily the exact grip point,
+# and pose landmarks have their own pixel noise, so this needs to be more forgiving than it
+# might seem: on a real test photo the actual gripping wrist sat ~30px from its hold's centroid
+# against a ~112px max reach radius (a 0.15 fraction, i.e. ~17px, missed every real contact).
+CONTACT_RADIUS_FRACTION = 0.35
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -64,6 +79,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for output artifacts")
     parser.add_argument("--save-vis", action="store_true", help="Save an annotated diagnostic overlay image")
+
+    parser.add_argument("--route-color", default=None, help="Filter candidate holds to this color (e.g. 'blue')")
+    parser.add_argument(
+        "--auto-route",
+        action="store_true",
+        help="Auto-detect the route color from holds nearest the climber's hands/feet",
+    )
 
     return parser
 
@@ -107,6 +129,35 @@ def average_visibility(pose: ClimberPose) -> float:
     return sum(pose.visibility.values()) / len(pose.visibility)
 
 
+def determine_dominant_route_color(
+    holds: list[HoldDetection],
+    contacts: dict[str, int | None],
+    pose: ClimberPose | None = None,
+) -> str | None:
+    """Infer a route's color, preferring holds the climber is actually contacting.
+
+    Falls back to whichever hold is nearest each limb regardless of distance only if no limb
+    registered a real contact - a much noisier signal, since "nearest" can be a hold nowhere
+    near actually gripped (e.g. tens of pixels away, on an ungrounded limb).
+    """
+    contacted_colors = [holds[idx].color for idx in contacts.values() if idx is not None]
+    if contacted_colors:
+        return Counter(contacted_colors).most_common(1)[0][0]
+
+    if pose is None or not holds:
+        return None
+
+    limb_names = ("LEFT_WRIST", "RIGHT_WRIST", "LEFT_ANKLE", "RIGHT_ANKLE")
+    nearest_colors = []
+    for limb in limb_names:
+        limb_position = pose.pixel[limb]
+        nearest_hold = min(holds, key=lambda h: math.dist(limb_position, h.centroid))
+        nearest_colors.append(nearest_hold.color)
+
+    color, _count = Counter(nearest_colors).most_common(1)[0]
+    return color
+
+
 def select_endpoint_hold_indices(detections: list[HoldDetection]) -> tuple[int, int]:
     """Return (bottom_index, top_index): holds with the largest/smallest centroid y."""
     bottom_idx = max(range(len(detections)), key=lambda i: detections[i].centroid[1])
@@ -146,7 +197,32 @@ def run_pipeline(args: argparse.Namespace) -> None:
         arm_span=args.arm_span * pixels_per_meter,
     )
 
+    contact_radius = climber.max_reach_radius * CONTACT_RADIUS_FRACTION
+
+    route_color = args.route_color
+    if args.auto_route:
+        pre_filter_contacts = find_contact_holds(pose, detections, contact_radius) if pose is not None else {}
+        auto_color = determine_dominant_route_color(detections, pre_filter_contacts, pose)
+        if auto_color is not None:
+            route_color = auto_color
+            logger.info("Auto-detected route color: %s", route_color)
+        else:
+            logger.warning("--auto-route requested but no pose/holds were available to infer a color")
+
+    if route_color is not None:
+        route_filtered = filter_by_color(detections, route_color)
+        if route_filtered:
+            detections = route_filtered
+            logger.info("Filtered to %d '%s' holds", len(detections), route_color)
+        else:
+            logger.warning("No holds matched route color '%s'; keeping all %d holds", route_color, len(detections))
+
     com = estimate_center_of_mass(pose) if pose is not None else None
+
+    # Recompute against `detections` as it stands now (post route-color filtering, if any),
+    # since hold indices shift once the list is filtered.
+    contacts = find_contact_holds(pose, detections, contact_radius) if pose is not None else {}
+    contact_hold_ids = sorted({idx for idx in contacts.values() if idx is not None})
 
     overlay = draw_detections(frame, detections)
     if pose is not None:
@@ -156,7 +232,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if len(detections) > 0:
         bottom_idx, top_idx = select_endpoint_hold_indices(detections)
 
-        if com is not None:
+        if contact_hold_ids:
+            graph = ReachabilityGraph.build(detections, climber)
+            start_id = contact_hold_ids
+        elif com is not None:
             graph = ReachabilityGraph.build(detections, climber, start_position=com)
             start_id = START_NODE_ID
         else:
@@ -173,7 +252,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if args.save_vis:
         cv2.imwrite(str(output_path), overlay)
 
-    print_summary(detections, pose, path, moves, total_cost, output_path if args.save_vis else None)
+    print_summary(
+        detections, pose, path, moves, total_cost, output_path if args.save_vis else None, contacts, route_color
+    )
 
 
 def print_summary(
@@ -183,8 +264,12 @@ def print_summary(
     moves: list[tuple[int, float]],
     total_cost: float | None,
     output_path: Path | None,
+    contacts: dict[str, int | None] | None = None,
+    route_color: str | None = None,
 ) -> None:
     print("\n=== BetaVision Pipeline Summary ===")
+    if route_color is not None:
+        print(f"Route color filter: {route_color}")
     print(f"Holds detected: {len(detections)}")
 
     if pose is not None:
@@ -194,6 +279,12 @@ def print_summary(
               f"R {spans.right_reach_distance:.1f}px")
     else:
         print("Climber pose confidence: no climber detected in frame")
+
+    if contacts:
+        contact_str = ", ".join(
+            f"{limb}: hold {idx}" if idx is not None else f"{limb}: none" for limb, idx in contacts.items()
+        )
+        print(f"Limb contacts: {contact_str}")
 
     if path is None:
         print("Beta path: none found (no holds, unreachable goal, or no route)")
