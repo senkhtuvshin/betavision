@@ -4,9 +4,7 @@ A computer vision pipeline that watches a bouldering photo or video, finds the h
 
 ## Demo
 
-![BetaVision annotated beta path](docs/demo.gif)
-
-*(placeholder — drop a screenshot or gif of `data/processed/beta_overlay.jpg` / `annotated_beta.mp4` here)*
+![BetaVision annotated beta path](docs/demo.jpg)
 
 ## System Architecture
 
